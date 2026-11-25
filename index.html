@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Live location</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    :root {
+      --bg: #0b0d10; --card: #12161b; --line: #2b333c; --text: #e6edf3; --muted: #8b98a5;
+      --accent: #00e5ff; --green: #00e676; --grey: #8e8e93; --red: #ff5370;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    #map { position: fixed; inset: 0; }
+    .leaflet-container { background: var(--bg); }
+
+    #panel { position: fixed; left: 0; right: 0; bottom: 0; z-index: 1000;
+      padding: 14px 16px calc(14px + env(safe-area-inset-bottom));
+      background: linear-gradient(to top, rgba(11,13,16,.96) 70%, rgba(11,13,16,0));
+    }
+    .card { max-width: 520px; margin: 0 auto; background: var(--card); border: 1px solid var(--line);
+      clip-path: polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 14px 100%, 0 calc(100% - 14px));
+      padding: 14px 16px; }
+    .row { display: flex; align-items: center; gap: 10px; }
+    .name { font-weight: 700; letter-spacing: .08em; text-transform: uppercase; flex: 1;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .badge { font-size: 11px; letter-spacing: .12em; padding: 3px 8px; color: #000; background: var(--grey); }
+    .badge.live { background: var(--green); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+    .tile { border: 1px solid var(--line); padding: 8px 10px; }
+    .tile small { display: block; color: var(--muted); font-size: 10px; letter-spacing: .15em; text-transform: uppercase; }
+    .tile b { font-size: 14px; }
+    .actions { display: flex; gap: 8px; margin-top: 12px; }
+    a.btn { flex: 1; text-align: center; text-decoration: none; color: #000; background: var(--accent);
+      padding: 10px 0; font-weight: 700; letter-spacing: .1em; font-size: 12px; }
+    #message { position: fixed; inset: 0; z-index: 2000; display: none; align-items: center; justify-content: center;
+      text-align: center; padding: 32px; background: var(--bg); }
+    #message h1 { font-size: 18px; letter-spacing: .12em; text-transform: uppercase; margin: 0 0 8px; }
+    #message p { color: var(--muted); margin: 0; }
+
+    /* map pin: green dot + glow + radiating rings when live, flat grey when stale */
+    .pin { position: relative; width: 0; height: 0; }
+    .pin .dot { position: absolute; left: -8px; top: -8px; width: 16px; height: 16px; border-radius: 50%;
+      background: var(--green); border: 3px solid #fff; box-shadow: 0 0 18px 6px rgba(0,230,118,.55); }
+    .pin .ring { position: absolute; left: -9px; top: -9px; width: 18px; height: 18px; border-radius: 50%;
+      border: 2px solid var(--green); opacity: 0; animation: ring 2.4s linear infinite; }
+    .pin .ring.r2 { animation-delay: .8s; } .pin .ring.r3 { animation-delay: 1.6s; }
+    @keyframes ring { 0% { transform: scale(.6); opacity: .65; } 100% { transform: scale(5); opacity: 0; } }
+    .pin.stale .dot { background: var(--grey); box-shadow: none; border-color: rgba(255,255,255,.8); }
+    .pin.stale .ring { display: none; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="panel">
+    <div class="card">
+      <div class="row">
+        <div class="name" id="name">Loading…</div>
+        <span class="badge" id="badge">…</span>
+      </div>
+      <div class="grid">
+        <div class="tile"><small>Updated</small><b id="updated">—</b></div>
+        <div class="tile"><small>Link expires in</small><b id="expires">—</b></div>
+        <div class="tile"><small>Battery</small><b id="battery">—</b></div>
+        <div class="tile"><small>Speed</small><b id="speed">—</b></div>
+      </div>
+      <div class="actions"><a class="btn" id="gmaps" href="#" target="_blank" rel="noopener">OPEN IN MAPS</a></div>
+    </div>
+  </div>
+
+  <div id="message"><div><h1 id="msg-title">Link unavailable</h1><p id="msg-body"></p></div></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+    import { getFirestore, doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js";
+
+    // ---- PASTE YOUR FIREBASE WEB APP CONFIG HERE (Firebase console > Project settings > Your apps > Web) ----
+    const firebaseConfig = {
+      apiKey: "PASTE_API_KEY",
+      authDomain: "PASTE_PROJECT_ID.firebaseapp.com",
+      projectId: "PASTE_PROJECT_ID",
+      appId: "PASTE_APP_ID"
+    };
+    // ---------------------------------------------------------------------------------------------------------
+
+    const $ = (id) => document.getElementById(id);
+    const token = new URLSearchParams(location.search).get("t");
+    const STALE_MS = 90 * 1000;   // grey the pin if no update for 90 s
+
+    function ended(title, body) {
+      $("msg-title").textContent = title;
+      $("msg-body").textContent = body;
+      $("message").style.display = "flex";
+    }
+
+    if (!token) {
+      ended("No link", "Open the full link that was shared with you.");
+    } else if (firebaseConfig.apiKey.startsWith("PASTE")) {
+      ended("Not configured", "Paste your Firebase web config into index.html, then redeploy.");
+    } else {
+      const map = L.map("map", { zoomControl: false, attributionControl: true }).setView([0, 0], 2);
+      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>'
+      }).addTo(map);
+
+      let marker = null, accuracyCircle = null, centered = false;
+      let data = null;
+
+      const pinHtml = (stale) =>
+        `<div class="pin ${stale ? "stale" : ""}"><span class="ring"></span><span class="ring r2"></span><span class="ring r3"></span><span class="dot"></span></div>`;
+
+      const ago = (ms) => {
+        const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+        if (s < 10) return "just now";
+        if (s < 60) return s + " s ago";
+        if (s < 3600) return Math.floor(s / 60) + " min ago";
+        return Math.floor(s / 3600) + " h ago";
+      };
+      const left = (ms) => {
+        const s = Math.max(0, Math.round(ms / 1000));
+        const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+        return h > 0 ? `${h} h ${m} min` : `${m} min ${s % 60} s`;
+      };
+
+      function render() {
+        if (!data) return;
+        const updated = data.updated ? data.updated.toMillis() : null;
+        const expires = data.expiresAt.toMillis();
+        if (expires <= Date.now()) { ended("Link expired", "This live location link has expired."); return; }
+
+        const stale = !updated || Date.now() - updated > STALE_MS;
+        $("name").textContent = data.deviceName || "Phone";
+        $("badge").textContent = stale ? "LAST KNOWN" : "LIVE";
+        $("badge").className = "badge" + (stale ? "" : " live");
+        $("updated").textContent = updated ? ago(updated) : "waiting…";
+        $("expires").textContent = left(expires - Date.now());
+        $("battery").textContent = data.battery != null ? data.battery + "%" + (data.charging ? " ⚡" : "") : "—";
+        $("speed").textContent = data.speedKmh != null ? Math.round(data.speedKmh) + " km/h" : "—";
+
+        if (data.lat != null && data.lng != null) {
+          const ll = [data.lat, data.lng];
+          const icon = L.divIcon({ className: "", html: pinHtml(stale), iconSize: [0, 0] });
+          if (!marker) marker = L.marker(ll, { icon, interactive: false }).addTo(map);
+          else { marker.setLatLng(ll); marker.setIcon(icon); }
+          if (data.accuracy) {
+            if (!accuracyCircle) accuracyCircle = L.circle(ll, { radius: data.accuracy, color: "#00e5ff", weight: 1, fillOpacity: 0.08 }).addTo(map);
+            else { accuracyCircle.setLatLng(ll); accuracyCircle.setRadius(data.accuracy); }
+          }
+          if (!centered) { map.setView(ll, 16); centered = true; } else { map.panTo(ll, { animate: true }); }
+          $("gmaps").href = `https://www.google.com/maps?q=${data.lat},${data.lng}`;
+        }
+      }
+
+      const db = getFirestore(initializeApp(firebaseConfig));
+      onSnapshot(
+        doc(db, "shares", token),
+        (snap) => {
+          if (!snap.exists()) { ended("Sharing stopped", "The owner stopped sharing this location."); return; }
+          $("message").style.display = "none";
+          data = snap.data();
+          render();
+        },
+        () => ended("Link expired", "This link has expired or is not valid.")
+      );
+      setInterval(render, 1000);
+    }
+  </script>
+</body>
+</html>
